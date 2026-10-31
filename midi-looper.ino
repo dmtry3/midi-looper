@@ -434,11 +434,39 @@ void halfLoop() {
     }
   }
   eventCount = newCount;
+
+  // Ноты, начатые в первой половине и закончившиеся во второй, потеряли Note Off.
+  // Закрываем их в конце нового лупа, иначе они будут залипать.
+  static int8_t bal[17][128];        // Note On минус Note Off по ch/pitch
+  static byte onLayer[17][128];      // слой ноты (чтобы undo снимал и добавленный Note Off)
+  memset(bal, 0, sizeof(bal));
+  for (int i = 0; i < eventCount; i++) {
+    const MidiEvent &e = events[i];
+    if (e.ch < 1 || e.ch > 16) continue;
+    if (e.type == 0x90 && e.d2 > 0) {
+      if (bal[e.ch][e.d1] < 127) bal[e.ch][e.d1]++;
+      onLayer[e.ch][e.d1] = e.layer;
+    } else if (e.type == 0x80 || (e.type == 0x90 && e.d2 == 0)) {
+      if (bal[e.ch][e.d1] > -127) bal[e.ch][e.d1]--;
+    }
+  }
+  uint16_t endTs = (uint16_t)(loopLenTicks - 1);
+  for (int ch = 1; ch <= 16; ch++) {
+    for (int p = 0; p < 128; p++) {
+      for (int k = 0; k < bal[ch][p] && eventCount < 5000; k++) {
+        events[eventCount++] = {endTs, (byte)0x80, (byte)p, (byte)0, (byte)ch, onLayer[ch][p], false};
+      }
+    }
+  }
+}
+
+bool doubleLoopFits() {
+  return loopLenTicks * 2 <= 65000 && eventCount * 2 <= 5000;
 }
 
 void doubleLoop() {
   if (loopLenTicks == 0 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
-  if (loopLenTicks * 2 > 65000) return;
+  if (!doubleLoopFits()) return;   // не дублируем частично
   int origCount = eventCount;
   unsigned long oldLen = loopLenTicks;
   for (int i = 0; i < origCount; i++) {
@@ -1239,7 +1267,8 @@ void uiDoLoad(int slot) {
 
 void uiDoApplyQuant() {
   if (eventCount <= 0 || loopLenTicks == 0) { toast("No loop"); return; }
-  if (quantGrid == 0 || quantStrength <= 0) { toast("Grid is OFF"); return; }
+  if (quantGrid == 0) { toast("Grid is OFF"); return; }
+  if (quantStrength <= 0) { toast("Strength is 0%"); return; }
   applyQuantizeToLoop();
   toast("Quantized");
 }
@@ -1253,6 +1282,7 @@ void uiDoHalf() {
 void uiDoDouble() {
   if (!loopIsPlaying()) { toast("Need playing loop"); return; }
   if (loopLenTicks * 2 > 65000) { toast("Too long"); return; }
+  if (!doubleLoopFits()) { toast("Too many events"); return; }
   doubleLoop();
   toast("Loop x2");
 }
@@ -1476,8 +1506,8 @@ void onMenuButtonPress(int i) {
 void onMenuButtonRelease(int i) {
   if (i == 1) {
     if (presetBtnDown && !presetLongFired) {
-      // короткое нажатие — выбор слота для LOAD
-      if (uiMode == UI_LOAD_SLOT) uiMode = UI_NORMAL;
+      // короткое нажатие — выбор слота для LOAD; в любом выборе слота — отмена
+      if (uiMode == UI_LOAD_SLOT || uiMode == UI_SAVE_SLOT) uiMode = UI_NORMAL;
       else { pendingSlot = selectedPresetSlot; uiMode = UI_LOAD_SLOT; }
     }
     presetBtnDown = false;
@@ -1862,7 +1892,7 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.print("Looper v2 ready");
+    display.print("Looper v2.2 ready");
     display.display();
   }
 #else

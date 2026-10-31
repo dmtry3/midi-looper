@@ -25,7 +25,7 @@ The compile-time feature flags (`USB_MIDI_ENABLED`, `PEDAL_ENABLED`, `OLED_ENABL
 
 ## Architecture
 
-**Time is measured in MIDI clock ticks, not milliseconds.** `PPQN = 24` and `BAR_TICKS = 96`. `currentTick` advances on every incoming F8 (`handleClock` → `advanceTick`). If no external clock has arrived for 1.2 s, `handleInternalClock` generates ticks at the last smoothed tempo (default ≈110 BPM). Event timestamps, `loopLenTicks`, `recStartTick` and `playStartTick` are all in ticks, so the loop follows tempo changes. The playback position is `(currentTick - playStartTick) % loopLenTicks`. Timestamps are `uint16_t`, which is why the loop length is capped at 65000 ticks (the README's "65 s" is really 65000 ticks).
+**Time is measured in MIDI clock ticks, not milliseconds.** `PPQN = 24` and `BAR_TICKS = 96`. `currentTick` advances on every incoming F8 (`handleClock` → `advanceTick`). If no external clock has arrived for 1.2 s, `handleInternalClock` generates ticks at the last smoothed tempo (default ≈110 BPM). Event timestamps, `loopLenTicks`, `recStartTick` and `playStartTick` are all in ticks, so the loop follows tempo changes. The playback position is `(currentTick - playStartTick) % loopLenTicks`. Timestamps are `uint16_t`, which is why the loop length is capped at 65000 ticks (677 bars, about 22 min at 120 BPM).
 
 - BPM is a moving average over a 48-tick ring buffer of `micros()` (`updateTempo`). `loopBeatDuration` (ms per beat) is derived from it and is used only for display and LED timing.
 - `bleBeatMs` is a *frozen* ms-per-beat, captured at record start or preset load. Its only job is converting ticks to ms for the BLE client (`ticksToBleMs`), which expects ms. Don't use it in the engine.
