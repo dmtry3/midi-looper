@@ -1,6 +1,10 @@
-// ESP32 MIDI Looper Engine v60
+// ESP32 MIDI Looper Engine v2 (tick-based, BPM moving average)
+// - время в лупе в тиках MIDI-клока (PPQN = 24): скорость лупа следует за темпом
+// - BPM: скользящее среднее периода тика по окну из N тиков (подавление дребезга клока)
+// - MIDI Start сбрасывает позицию лупа, не меняя состояние
 // - индикация нот: диапазон 24..103 (без 2 нижних и 2 верхних октав)
 // - индикация показывает и ноты, которые играет сам лупер
+// - CC в овердабе: перезапись поверх (стирание старых CC там, где прошла ручка)
 #include <HardwareSerial.h>
 #include <MIDI.h>
 #include <BLEDevice.h>
@@ -15,6 +19,7 @@
 // ===== USB MIDI (только ESP32-S2 / ESP32-S3) =====
 // 1 = включить. В Arduino IDE: Tools -> USB Mode -> "USB-OTG (TinyUSB)".
 #define USB_MIDI_ENABLED 1
+
 #if USB_MIDI_ENABLED
   #if !(CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3)
     #error "USB MIDI requires ESP32-S2 or ESP32-S3 (native USB)"
@@ -30,6 +35,9 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define PRESET_COUNT 5
+
+// Магическое число пресета (v2: длина лупа в тиках). Старые пресеты в мс отклоняются.
+#define PRESET_MAGIC 0x4C505346UL
 
 // Окно защиты от эха (мс): входящие ноты той же высоты сразу после того, как
 // лупер сам их отправил, считаются эхом и игнорируются.
@@ -110,8 +118,10 @@ const unsigned long PRESET_LONG_PRESS_MS = 2000;
 
 HardwareSerial MIDI_Serial(2);
 MIDI_CREATE_INSTANCE(HardwareSerial, MIDI_Serial, MIDI);
+
 const int pwmFreq = 5000;
 const int pwmRes = 8;
+
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
 unsigned long lastBleUpdate = 0;
@@ -120,6 +130,7 @@ const unsigned long BLE_INTERVAL = 30;
 // --- ПРЕСЕТЫ (save/load лупов через LittleFS) ---
 bool needSendPresetStatus = false;
 unsigned long connectStatusTime = 0;
+
 bool visualDumpActive = false;
 int visualDumpIndex = 0;
 unsigned long lastVisualDumpTime = 0;
@@ -128,6 +139,7 @@ int visualDumpFinishStage = 0;
 unsigned long visualDumpFinishTime = 0;
 const unsigned long VISUAL_DUMP_EVENT_INTERVAL = 5;
 const unsigned long VISUAL_DUMP_POS_INTERVAL   = 80;
+
 int pendingLoadSlot = -1;
 
 // Кэш наличия пресетов (чтобы не читать флеш при каждой перерисовке экрана)
@@ -138,8 +150,42 @@ enum QuantTarget { QUANT_START = 0, QUANT_END = 1, QUANT_BOTH = 2 };
 int quantGrid = 0;
 int quantStrength = 100;
 int quantTarget = QUANT_BOTH;
-unsigned long loopBeatDuration = 545;
-const int MIN_NOTE_LEN_MS = 20;
+unsigned long loopBeatDuration = 545;   // мс на долю (сглаженное значение)
+
+// ===== ТИКОВОЕ ВРЕМЯ =====
+#define PPQN        24
+#define BEAT_TICKS  PPQN
+#define BAR_TICKS   (PPQN * 4)
+#define MIN_NOTE_TICKS 1
+
+volatile uint32_t currentTick = 0;     // индекс последнего обработанного тика клока
+volatile bool startArmed = false;      // после Start первый F8 = тик 0 (без инкремента)
+
+// ===== BPM: СКОЛЬЗЯЩЕЕ СРЕДНЕЕ =====
+// Окно из последних N тиков клока. Средний период тика = (t_now - t_oldest) / N.
+#define BPM_WINDOW_TICKS 48        // 2 доли; 24 = отзывчивее, 96 = стабильнее
+#define BPM_MIN_SAMPLES  24        // оценка начинается после 1 доли
+const float BPM_MIN = 20.0f, BPM_MAX = 300.0f;
+
+float activeBPM = 60000.0f / 545.0f;          // сглаженный BPM
+uint32_t tickPeriodUs = 545000UL / PPQN;      // сглаженный период тика (мкс), для внутреннего клока
+uint32_t tickTimesUs[BPM_WINDOW_TICKS];       // кольцевой буфер меток micros()
+uint16_t tickTimeIdx = 0;                     // куда писать следующую метку
+uint16_t tickTimeCount = 0;                   // сколько меток накоплено
+
+// "Опорная" длительность доли для BLE-клиента (клиент ждёт миллисекунды).
+// Фиксируется при старте записи / загрузке пресета, чтобы картинка на клиенте
+// не плыла при смене темпа (положение в лупе передаётся нормализованным /pos).
+uint32_t bleBeatMs = 545;
+
+uint32_t recStartTick = 0, playStartTick = 0, loopLenTicks = 0;
+
+inline uint32_t ticksSince(uint32_t base) {            // безопасно для OLED-задачи
+  int32_t d = (int32_t)(currentTick - base);
+  return d < 0 ? 0 : (uint32_t)d;
+}
+inline uint32_t ticksToMs(uint32_t t)    { return (uint32_t)(((uint64_t)t * loopBeatDuration) / PPQN); } // живой темп (OLED)
+inline uint32_t ticksToBleMs(uint32_t t) { return (uint32_t)(((uint64_t)t * bleBeatMs) / PPQN); }        // для BLE
 
 // --- ФИЛЬТР КАНАЛОВ ЗАПИСИ ---
 // Бит 0 = канал 1 ... бит 15 = канал 16. 1 = канал записывается.
@@ -150,6 +196,7 @@ uint16_t recChannelMask = DEFAULT_CH_MASK;
 enum ClockSrc : uint8_t { CLK_DIN = 0, CLK_USB = 1 };
 uint8_t activeClockSrc = CLK_DIN;
 unsigned long lastClockSrcTime = 0;
+
 bool acceptClockSource(uint8_t src) {
   unsigned long now = millis();
   if (src == activeClockSrc || now - lastClockSrcTime > 500) {
@@ -169,6 +216,7 @@ byte heldVel[17][128];
 // ДВИЖОК ЛУПЕРА
 enum LooperState { STATE_IDLE, STATE_RECORDING, STATE_PLAYING, STATE_OVERDUB };
 LooperState looperState = STATE_IDLE;
+
 volatile bool pendingStart = false;
 volatile bool pendingStop = false;
 volatile unsigned long lastBeatTime = 0;
@@ -176,16 +224,16 @@ volatile unsigned long lastClockTime = 0;
 volatile int beatInBar = 0;
 volatile int tickInBeat = 0;
 unsigned long beatDuration = 545;
+
 struct MidiEvent {
-  uint16_t timestamp;
+  uint16_t timestamp;     // в ТИКАХ (PPQN = 24)
   byte type, d1, d2, ch, layer;
   bool played;
 };
+
 MidiEvent events[5000];
 int eventCount = 0;
 byte currentLayer = 0;
-byte ccMaxLayer[17][128];
-unsigned long loopLen = 0, recStart = 0, playStart = 0;
 unsigned long lastSentNoteTime[16][128], lastSentCCTime[16][128], lastSentATTime[16], ccTakeover[17][128];
 
 // --- UI ---
@@ -260,8 +308,9 @@ String stateName() {
     default:              return "IDLE";
   }
 }
+
 void sendBeatInfo() {
-  sendBleNotify("/beatinfo " + String(loopBeatDuration));
+  sendBleNotify("/beatinfo " + String(bleBeatMs));
 }
 
 // ================== ФИЛЬТР КАНАЛОВ ==================
@@ -300,6 +349,58 @@ void sendChannelStatus() {
 void resetActiveNoteTracking() {
   for (int i = 0; i < 17; i++) for (int j = 0; j < 128; j++) activeNoteStartTs[i][j] = 0xFFFF;
 }
+
+// ===== CC В ОВЕРДАБЕ: перезапись поверх =====
+// При движении ручки в овердабе стираются старые события этого ch/cc в диапазоне лупа,
+// который "проехала" ручка, и пишутся новые. Пока овердаб включён, CC, которые трогали,
+// не воспроизводятся (ни старые, ни новые); воспроизведение возвращается при выходе из овердаба.
+#define CC_OVERDUB_GAP_MS 1000     // пауза ручки, после которой перезапись останавливается
+
+struct CcOdState {
+  uint32_t ms;        // millis() последнего CC
+  uint32_t tick;      // currentTick последнего CC
+  uint16_t pos;       // позиция в лупе последнего CC
+  bool touched;       // CC трогали в этом овердабе -> не воспроизводим до выхода из овердаба
+};
+CcOdState ccOd[17][128];
+bool ccOdErased = false;
+
+void startVisualDump() {
+  sendBleNotify("/reset 1");
+  sendBleNotify("/state RECORDING");
+  visualDumpIndex = 0;
+  visualDumpLastPosSend = millis();
+  visualDumpFinishStage = 0;
+  visualDumpActive = true;
+}
+
+// Удаляет CC (ch,cc) в диапазоне тиков [start, start+count) по кругу лупа
+void eraseCCRange(byte ch, byte cc, uint32_t start, uint32_t count) {
+  if (loopLenTicks == 0 || count == 0) return;
+  if (count > loopLenTicks) count = loopLenTicks;
+  start %= loopLenTicks;
+  int n = 0;
+  for (int i = 0; i < eventCount; i++) {
+    const MidiEvent &e = events[i];
+    if (e.type == 0xB0 && e.ch == ch && e.d1 == cc) {
+      uint32_t rel = ((uint32_t)(e.timestamp % loopLenTicks) + loopLenTicks - start) % loopLenTicks;
+      if (rel < count) continue;               // удалить
+    }
+    if (n != i) events[n] = events[i];
+    n++;
+  }
+  eventCount = n;
+}
+
+// Вызывается при выходе из OVERDUB (в любую сторону)
+void onOverdubExit() {
+  memset(ccOd, 0, sizeof(ccOd));
+  if (ccOdErased) {
+    ccOdErased = false;
+    if (deviceConnected && !visualDumpActive && loopLenTicks > 0) startVisualDump();
+  }
+}
+
 void resetLooper() {
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90) {
@@ -307,39 +408,39 @@ void resetLooper() {
     }
   }
   vizClear(vizOut);
-
   looperState = STATE_IDLE;
   eventCount = 0;
   currentLayer = 0;
-  loopLen = 0;
-  recStart = 0;
-  playStart = 0;
+  loopLenTicks = 0;
+  recStartTick = 0;
+  playStartTick = 0;
   pendingStart = false;
   pendingStop = false;
   pendingLoadSlot = -1;
   resetActiveNoteTracking();
-
   sendBleNotify("/reset 1");
 }
+
 void halfLoop() {
-  if (loopLen < 500 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
+  if (loopLenTicks < BEAT_TICKS || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90) sendMidi(0x80, events[i].d1, 0, events[i].ch);
   }
-  loopLen /= 2;
+  loopLenTicks /= 2;
   int newCount = 0;
   for (int i = 0; i < eventCount; i++) {
-    if (events[i].timestamp < loopLen) {
+    if (events[i].timestamp < loopLenTicks) {
       events[newCount++] = events[i];
     }
   }
   eventCount = newCount;
 }
+
 void doubleLoop() {
-  if (loopLen == 0 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
-  if (loopLen * 2 > 65000) return;
+  if (loopLenTicks == 0 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
+  if (loopLenTicks * 2 > 65000) return;
   int origCount = eventCount;
-  unsigned long oldLen = loopLen;
+  unsigned long oldLen = loopLenTicks;
   for (int i = 0; i < origCount; i++) {
     if (eventCount < 5000) {
       MidiEvent newEv = events[i];
@@ -348,18 +449,16 @@ void doubleLoop() {
       events[eventCount++] = newEv;
     }
   }
-  loopLen *= 2;
+  loopLenTicks *= 2;
 }
 
 // --- ТРАНСПОНИРОВАНИЕ ЛУПА (полутоны) ---
 void transposeLoop(int semitones) {
-  if (loopLen == 0 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
+  if (loopLenTicks == 0 || (looperState != STATE_PLAYING && looperState != STATE_OVERDUB)) return;
   if (semitones == 0) return;
-
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90) sendMidi(0x80, events[i].d1, 0, events[i].ch);
   }
-
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90 || events[i].type == 0x80) {
       int newPitch = (int)events[i].d1 + semitones;
@@ -368,7 +467,6 @@ void transposeLoop(int semitones) {
       events[i].d1 = (byte)newPitch;
     }
   }
-
   sendBleNotify("/reset 1");
   sendBleNotify("/state RECORDING");
   visualDumpIndex = 0;
@@ -378,19 +476,18 @@ void transposeLoop(int semitones) {
 }
 
 // --- UNDO: удаляет последний записанный слой овердаба ---
+// Примечание: старые CC, стёртые перезаписью в этом слое, НЕ восстанавливаются.
 void undoLastLayer() {
-  if (loopLen == 0 || currentLayer == 0) {
+  if (loopLenTicks == 0 || currentLayer == 0) {
     sendBleNotify("/undo_err 1"); // нечего отменять
     return;
   }
   byte layerToRemove = currentLayer;
-
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90 && events[i].layer == layerToRemove) {
       sendMidi(0x80, events[i].d1, 0, events[i].ch);
     }
   }
-
   int newCount = 0;
   for (int i = 0; i < eventCount; i++) {
     if (events[i].layer != layerToRemove) {
@@ -399,20 +496,10 @@ void undoLastLayer() {
   }
   eventCount = newCount;
   currentLayer--;
-
-  for (int i = 0; i < 17; i++) for (int j = 0; j < 128; j++) ccMaxLayer[i][j] = 0;
-  for (int i = 0; i < eventCount; i++) {
-    if (events[i].type == 0xB0 && events[i].layer > ccMaxLayer[events[i].ch][events[i].d1]) {
-      ccMaxLayer[events[i].ch][events[i].d1] = events[i].layer;
-    }
-  }
-
   if (looperState == STATE_OVERDUB) {
     looperState = STATE_PLAYING;
   }
-
   sendBleNotify("/undo_ok 1");
-
   sendBleNotify("/reset 1");
   sendBleNotify("/state RECORDING");
   visualDumpIndex = 0;
@@ -421,44 +508,37 @@ void undoLastLayer() {
   visualDumpActive = true;
 }
 
-// Длительность шага текущей сетки квантования в мс (0, если квант выключен)
-float quantUnitMs() {
-  if (quantGrid == 0 || loopBeatDuration == 0) return 0.0f;
+// Шаг текущей сетки квантования в ТИКАХ (0, если квант выключен)
+uint16_t quantUnitTicks() {
   switch (quantGrid) {
-    case 1: return (float)loopBeatDuration / 8.0f;  // Q32
-    case 2: return (float)loopBeatDuration / 4.0f;  // Q16
-    case 3: return (float)loopBeatDuration / 2.0f;  // Q8
-    case 4: return (float)loopBeatDuration;         // Q4
-    default: return 0.0f;
+    case 1: return BEAT_TICKS / 8;   // Q32 = 3
+    case 2: return BEAT_TICKS / 4;   // Q16 = 6
+    case 3: return BEAT_TICKS / 2;   // Q8  = 12
+    case 4: return BEAT_TICKS;       // Q4  = 24
+    default: return 0;
   }
 }
 
 uint16_t quantizeTimestamp(uint16_t rawTs, unsigned long loopLenLocal) {
-  if (quantGrid == 0 || quantStrength <= 0 || loopBeatDuration == 0) return rawTs;
-  float unit = quantUnitMs();
-  if (unit < 1.0f) unit = 1.0f;
-
-  float nearest = round((float)rawTs / unit) * unit;
-  float blended = (float)rawTs + (nearest - (float)rawTs) * ((float)quantStrength / 100.0f);
-  long result = (long)(blended + 0.5f);
-
+  int32_t unit = quantUnitTicks();
+  if (unit == 0 || quantStrength <= 0) return rawTs;
+  int32_t nearest = (((int32_t)rawTs + unit / 2) / unit) * unit;
+  int32_t delta   = nearest - (int32_t)rawTs;
+  int32_t result  = (int32_t)rawTs + (delta * quantStrength + (delta >= 0 ? 50 : -50)) / 100;
   if (result < 0) result = 0;
-  if (loopLenLocal > 0 && result >= (long)loopLenLocal) result = (long)loopLenLocal - 1;
+  if (loopLenLocal > 0 && result >= (int32_t)loopLenLocal) result = (int32_t)loopLenLocal - 1;
   if (result > 65000) result = 65000;
   return (uint16_t)result;
 }
 
 uint16_t protectNoteEnd(uint16_t startTs, uint16_t endTs, unsigned long loopLenLocal, bool isDuringRecording) {
-  float unit = quantUnitMs();
-  long minLen = (unit >= 1.0f) ? (long)(unit + 0.5f) : MIN_NOTE_LEN_MS;
-  if (minLen < MIN_NOTE_LEN_MS) minLen = MIN_NOTE_LEN_MS;
-
+  long unit = (quantGrid != 0 && quantStrength > 0) ? (long)quantUnitTicks() : 0;
+  long minLen = (unit > MIN_NOTE_TICKS) ? unit : MIN_NOTE_TICKS;
   long diff = (long)endTs - (long)startTs;
-  long wrapThreshold = (long)(unit * 3.0f);
-  if (wrapThreshold < 200) wrapThreshold = 200;
+  long wrapThreshold = unit * 3;
+  if (wrapThreshold < BEAT_TICKS / 2) wrapThreshold = BEAT_TICKS / 2;   // 12 тиков
   bool looksLikeWrap = (diff < -wrapThreshold);
   if (looksLikeWrap || diff >= minLen) return endTs;
-
   long minEnd = (long)startTs + minLen;
   long bound = isDuringRecording ? 65000L : (loopLenLocal > 0 ? (long)loopLenLocal - 1 : 65000L);
   if (minEnd > bound) minEnd = bound;
@@ -467,7 +547,7 @@ uint16_t protectNoteEnd(uint16_t startTs, uint16_t endTs, unsigned long loopLenL
 }
 
 void applyQuantizeToLoop() {
-  if (eventCount <= 0 || loopLen == 0) {
+  if (eventCount <= 0 || loopLenTicks == 0) {
     sendBleNotify("/qapply_err 1");
     return;
   }
@@ -475,43 +555,35 @@ void applyQuantizeToLoop() {
     sendBleNotify("/qapply_err 2");
     return;
   }
-
   resetActiveNoteTracking();
-
   for (int i = 0; i < eventCount; i++) {
     bool isNoteStart = (events[i].type == 0x90 && events[i].d2 > 0);
     bool isNoteEnd   = (events[i].type == 0x80 || (events[i].type == 0x90 && events[i].d2 == 0));
     byte ch = events[i].ch;
     byte pitch = events[i].d1;
     uint16_t rawTs = events[i].timestamp;
-
     bool doQuant = false;
     if (events[i].type == 0xB0) {
-      doQuant = (quantTarget == QUANT_START || quantTarget == QUANT_BOTH);
+      doQuant = false;   // CC не квантуем: иначе плавные свипы превращаются в ступеньки
     } else if (isNoteStart) {
       doQuant = (quantTarget == QUANT_START || quantTarget == QUANT_BOTH);
     } else if (isNoteEnd) {
       doQuant = (quantTarget == QUANT_END || quantTarget == QUANT_BOTH);
     }
-
     uint16_t newTs = rawTs;
-    if (doQuant) newTs = quantizeTimestamp(rawTs, loopLen);
-
+    if (doQuant) newTs = quantizeTimestamp(rawTs, loopLenTicks);
     if (isNoteStart) {
       activeNoteStartTs[ch][pitch] = newTs;
     } else if (isNoteEnd) {
       uint16_t startTs = activeNoteStartTs[ch][pitch];
       if (startTs != 0xFFFF) {
-        newTs = protectNoteEnd(startTs, newTs, loopLen, false);
+        newTs = protectNoteEnd(startTs, newTs, loopLenTicks, false);
         activeNoteStartTs[ch][pitch] = 0xFFFF;
       }
     }
-
     events[i].timestamp = newTs;
   }
-
   sendBleNotify("/qapply_ok 1");
-
   sendBleNotify("/reset 1");
   sendBleNotify("/state RECORDING");
   visualDumpIndex = 0;
@@ -537,15 +609,16 @@ void sendPresetStatus() {
 void sendQuantStatus() {
   sendBleNotify("/quant " + String(quantGrid) + " " + String(quantStrength) + " " + String(quantTarget));
 }
+
 bool savePreset(int slot) {
-  if (eventCount <= 0 || loopLen == 0 || looperState == STATE_IDLE || looperState == STATE_RECORDING) {
+  if (eventCount <= 0 || loopLenTicks == 0 || looperState == STATE_IDLE || looperState == STATE_RECORDING) {
     sendBleNotify("/save_err " + String(slot));
     return false;
   }
   File f = LittleFS.open(presetPath(slot), "w");
   if (!f) { sendBleNotify("/save_err " + String(slot)); return false; }
-  uint32_t magic = 0x4C505345UL;
-  uint32_t ll = (uint32_t)loopLen;
+  uint32_t magic = PRESET_MAGIC;
+  uint32_t ll = (uint32_t)loopLenTicks;
   int32_t ec = (int32_t)eventCount;
   f.write((uint8_t*)&magic, sizeof(magic));
   f.write((uint8_t*)&ll, sizeof(ll));
@@ -557,69 +630,58 @@ bool savePreset(int slot) {
   sendPresetStatus();
   return true;
 }
+
 bool loadPreset(int slot) {
   if (!presetExists(slot)) { sendBleNotify("/load_err " + String(slot)); return false; }
   File f = LittleFS.open(presetPath(slot), "r");
   if (!f) { sendBleNotify("/load_err " + String(slot)); return false; }
-
   uint32_t magic = 0, ll = 0;
   int32_t ec = 0;
   f.read((uint8_t*)&magic, sizeof(magic));
   f.read((uint8_t*)&ll, sizeof(ll));
   f.read((uint8_t*)&ec, sizeof(ec));
-
-  if (magic != 0x4C505345UL || ec <= 0 || ec > 5000) {
+  if (magic != PRESET_MAGIC || ec <= 0 || ec > 5000 || ll == 0 || ll > 65000) {
     f.close();
     sendBleNotify("/load_err " + String(slot));
     return false;
   }
-
-  unsigned long now = millis();
-  unsigned long prevPos = 0;
-  bool hadPrevLoop = (loopLen > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB));
+  uint32_t prevPos = 0;
+  bool hadPrevLoop = (loopLenTicks > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB));
   if (hadPrevLoop) {
-    prevPos = (now - playStart) % loopLen;
+    prevPos = (currentTick - playStartTick) % loopLenTicks;
   }
-
   for (int i = 0; i < eventCount; i++) {
     if (events[i].type == 0x90) sendMidi(0x80, events[i].d1, 0, events[i].ch);
   }
-
   size_t toRead = sizeof(MidiEvent) * (size_t)ec;
   size_t got = f.read((uint8_t*)events, toRead);
   f.close();
   if (got != toRead) { sendBleNotify("/load_err " + String(slot)); return false; }
-
-  loopLen = ll;
+  loopLenTicks = ll;
   eventCount = ec;
   currentLayer = 0;
-  for (int i = 0; i < 17; i++) for (int j = 0; j < 128; j++) ccMaxLayer[i][j] = 0;
   for (int i = 0; i < eventCount; i++) {
     events[i].played = false;
     if (events[i].layer > currentLayer) currentLayer = events[i].layer;
-    if (events[i].type == 0xB0 && events[i].layer > ccMaxLayer[events[i].ch][events[i].d1]) {
-      ccMaxLayer[events[i].ch][events[i].d1] = events[i].layer;
-    }
   }
-
   resetActiveNoteTracking();
   pendingStart = false;
   pendingStop = false;
   looperState = STATE_PLAYING;
-
-  unsigned long newPos = (loopLen > 0) ? (prevPos % loopLen) : 0;
-  playStart = now - newPos;
-
+  uint32_t newPos = prevPos % loopLenTicks;
+  playStartTick = currentTick - newPos;
+  bleBeatMs = loopBeatDuration;
+  sendBeatInfo();
   sendBleNotify("/reset 1");
   sendBleNotify("/state RECORDING");
   visualDumpIndex = 0;
   visualDumpLastPosSend = millis();
   visualDumpFinishStage = 0;
   visualDumpActive = true;
-
   sendBleNotify("/load_ok " + String(slot));
   return true;
 }
+
 // Загрузка всегда отложенная:
 //  - если луп играет — в конце текущего круга (обрабатывается в playback());
 //  - если лупа нет / идёт запись — на первой доле такта (см. triggerQuantizedAction()).
@@ -627,6 +689,7 @@ void requestLoadPreset(int slot) {
   pendingLoadSlot = slot;
   sendBleNotify("/load_pending " + String(slot));
 }
+
 void deletePreset(int slot) {
   String path = presetPath(slot);
   if (LittleFS.exists(path)) LittleFS.remove(path);
@@ -641,6 +704,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
       if (rxValue.length() > 0) {
         String cmd = String(rxValue.c_str());
         cmd.trim();
+
         if (cmd == "/half") {
           halfLoop();
         }
@@ -726,6 +790,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
       }
     }
 };
+
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
@@ -772,8 +837,6 @@ void captureHeldNotesAtStart() {
 }
 
 void triggerQuantizedAction() {
-  unsigned long now = millis();
-
   // Отложенная загрузка пресета, когда луп не играет (IDLE/RECORDING):
   // стартуем ровно с первой доли такта. Загрузка имеет приоритет над armed REC/STOP.
   if (pendingLoadSlot >= 1 && looperState != STATE_PLAYING && looperState != STATE_OVERDUB) {
@@ -786,40 +849,125 @@ void triggerQuantizedAction() {
   }
 
   if (pendingStart) {
-    eventCount = 0; currentLayer = 0; recStart = now;
+    eventCount = 0; currentLayer = 0;
+    recStartTick = currentTick;
+    bleBeatMs = loopBeatDuration;                // опорный темп для BLE-клиента
     looperState = STATE_RECORDING;
-    for(int i=0; i<17; i++) for(int j=0; j<128; j++) ccMaxLayer[i][j] = 0;
     resetActiveNoteTracking();
     pendingStart = false;
     sendBleNotify("/state RECORDING");
     captureHeldNotesAtStart();
   }
   else if (pendingStop) {
-    loopLen = now - recStart; playStart = now;
+    uint32_t len = currentTick - recStartTick;
+    if (len == 0) return;                        // защита от нулевого лупа (напр. Start в этот же тик)
+    if (len > 65000) len = 65000;
+    loopLenTicks = len;
+    playStartTick = currentTick;
+    for (int i = 0; i < eventCount; i++)         // квантование могло вытолкнуть событие за конец лупа
+      if (events[i].timestamp >= len) events[i].timestamp = (uint16_t)(len - 1);
     looperState = STATE_PLAYING;
     pendingStop = false;
     sendBeatInfo();
     sendBleNotify("/state PLAYING");
   }
 }
-void handleStart() { tickInBeat = 0; beatInBar = 0; lastBeatTime = millis(); }
-void handleClock() {
+
+// ================== КЛОК / START / СГЛАЖИВАНИЕ BPM ==================
+
+// Глушим ноты, которые лупер уже сыграл (дедуп по ch/pitch),
+// чтобы при перескоке на 0 не было дублей/залипаний
+void silenceLooperNotes() {
+  static uint8_t sent[16][16];
+  memset(sent, 0, sizeof(sent));
   unsigned long now = millis();
-  lastClockTime = now;
+  for (int i = 0; i < eventCount; i++) {
+    const MidiEvent &e = events[i];
+    if (e.type != 0x90 || e.d2 == 0 || !e.played) continue;
+    uint8_t c = e.ch - 1, byteIdx = e.d1 >> 3, bit = 1 << (e.d1 & 7);
+    if (sent[c][byteIdx] & bit) continue;
+    sent[c][byteIdx] |= bit;
+    lastSentNoteTime[c][e.d1] = now;
+    sendMidi(0x80, e.d1, 0, e.ch);
+  }
+  vizClear(vizOut);
+}
+
+void handleStart() {
+  tickInBeat = 0;
+  beatInBar = 0;
+  currentTick = 0;
+  startArmed = true;            // первый F8 после Start = тик 0
+  lastBeatTime = millis();
+  recStartTick = 0;
+  playStartTick = 0;            // pos == 0
+  silenceLooperNotes();         // до сброса played
+  for (int i = 0; i < eventCount; i++) events[i].played = false;
+  // looperState НЕ меняем.
+  if (looperState == STATE_RECORDING) {
+    // запись продолжается с нулевой позиции: старый дубль привязан к старой временной шкале
+    eventCount = 0;
+    currentLayer = 0;
+    resetActiveNoteTracking();
+    sendBleNotify("/reset 1");
+    sendBleNotify("/state RECORDING");
+    captureHeldNotesAtStart();
+  }
+  // OVERDUB: слои сохраняются, воспроизведение и запись идут с нуля
+  // Сегменты перезаписи CC начнутся заново (флаг touched сохраняется — CC остаются заглушены)
+  for (int c = 0; c < 17; c++) for (int n = 0; n < 128; n++) ccOd[c][n].ms = 0;
+}
+
+// Continue (0xFB) не должен обнулять позицию
+void handleContinue() {
+  lastBeatTime = millis();
+}
+
+// Скользящее среднее периода тика. Вызывается на КАЖДОМ входящем тике клока.
+// Средний период = (t_now - t_oldest) / N, где N = число интервалов в окне.
+void updateTempo(uint32_t nowUs) {
+  if (tickTimeCount >= BPM_MIN_SAMPLES) {
+    // при неполном буфере самая старая метка — [0], при полном — [tickTimeIdx]
+    uint32_t oldestUs = (tickTimeCount < BPM_WINDOW_TICKS) ? tickTimesUs[0] : tickTimesUs[tickTimeIdx];
+    uint32_t span = nowUs - oldestUs;                   // tickTimeCount интервалов
+    float tickUs = (float)span / (float)tickTimeCount;
+    float bpm = 60000000.0f / (tickUs * (float)PPQN);
+    if (bpm >= BPM_MIN && bpm <= BPM_MAX) {
+      activeBPM = bpm;
+      tickPeriodUs = (uint32_t)(tickUs + 0.5f);
+      loopBeatDuration = (unsigned long)(tickUs * (float)PPQN / 1000.0f + 0.5f);
+      beatDuration = loopBeatDuration;
+    }
+  }
+  tickTimesUs[tickTimeIdx] = nowUs;
+  tickTimeIdx = (tickTimeIdx + 1) % BPM_WINDOW_TICKS;
+  if (tickTimeCount < BPM_WINDOW_TICKS) tickTimeCount++;
+}
+
+// Общее продвижение тика (внешний и внутренний клок)
+void advanceTick(unsigned long now) {
+  if (startArmed) startArmed = false;
+  else currentTick++;
 
   if (tickInBeat == 0) {
-    beatDuration = now - lastBeatTime;
     lastBeatTime = now;
-    loopBeatDuration = beatDuration;
     if (beatInBar == 0) triggerQuantizedAction();
   }
-  tickInBeat++;
-  if (tickInBeat >= 24) { tickInBeat = 0; beatInBar = (beatInBar + 1) % 4; }
+  tickInBeat = tickInBeat + 1;
+  if (tickInBeat >= PPQN) { tickInBeat = 0; beatInBar = (beatInBar + 1) % 4; }
+}
+
+void handleClock() {
+  unsigned long now = millis();
+  uint32_t nowUs = micros();
+  if (now - lastClockTime > 500) tickTimeCount = 0;     // клок пропадал -> окно недостоверно
+  lastClockTime = now;
+  updateTempo(nowUs);
+  advanceTick(now);
 }
 
 void recordEvent(byte t, byte d1, byte d2, byte ch) {
   if (ch < 1 || ch > 16) return;
-
   bool isNoteStart = (t == 0x90 && d2 > 0);
   bool isNoteEnd   = (t == 0x80 || (t == 0x90 && d2 == 0));
   bool hasOpenNote = (activeNoteStartTs[ch][d1] != 0xFFFF);
@@ -850,8 +998,11 @@ void recordEvent(byte t, byte d1, byte d2, byte ch) {
   }
 
   if (isNoteStart) heldVel[ch][d1] = d2;
-
-  if (t == 0xB0) { if (now - lastSentCCTime[ch-1][d1] < 15) return; ccTakeover[ch][d1] = now; ccMaxLayer[ch][d1] = currentLayer; }
+  if (t == 0xB0) {
+    if (now - lastSentCCTime[ch-1][d1] < 15) return;
+    // живой перехват работает только вне овердаба (в овердабе CC глушится флагом ccOd.touched)
+    if (looperState != STATE_OVERDUB) ccTakeover[ch][d1] = now;
+  }
   if (t == 0xD0 || t == 0xA0) if (now - lastSentATTime[ch-1] < 15) return;
 
   bool isRecOrOver = (looperState == STATE_RECORDING || looperState == STATE_OVERDUB);
@@ -861,23 +1012,24 @@ void recordEvent(byte t, byte d1, byte d2, byte ch) {
   //  - в PLAYING только Note Off для ноты, начатой в овердабе (чтобы не залипала).
   bool recordIt = false;
   if (isRecOrOver) recordIt = !(isNoteEnd && !hasOpenNote);
-  else if (looperState == STATE_PLAYING && loopLen > 0 && isNoteEnd && hasOpenNote) recordIt = true;
+  else if (looperState == STATE_PLAYING && loopLenTicks > 0 && isNoteEnd && hasOpenNote) recordIt = true;
 
   uint16_t finalTs = 0;
   if (isRecOrOver || recordIt) {
-    unsigned long rawTs = (looperState == STATE_RECORDING) ? (now - recStart) : ((now - playStart) % loopLen);
+    uint32_t rawTs = (looperState == STATE_RECORDING)
+        ? ticksSince(recStartTick)
+        : ((currentTick - playStartTick) % loopLenTicks);
     finalTs = (uint16_t)(rawTs > 65000 ? 65000 : rawTs);
 
+    // CC НЕ квантуем: иначе плавный свип превращается в ступеньки
     bool doQuant = false;
-    if (t == 0xB0) {
-      doQuant = (quantTarget == QUANT_START || quantTarget == QUANT_BOTH);
-    } else if (isNoteStart) {
+    if (isNoteStart) {
       doQuant = (quantTarget == QUANT_START || quantTarget == QUANT_BOTH);
     } else if (isNoteEnd) {
       doQuant = (quantTarget == QUANT_END || quantTarget == QUANT_BOTH);
     }
     if (doQuant) {
-      unsigned long loopLenForClamp = (looperState == STATE_RECORDING) ? 0 : loopLen;
+      unsigned long loopLenForClamp = (looperState == STATE_RECORDING) ? 0 : loopLenTicks;
       finalTs = quantizeTimestamp(finalTs, loopLenForClamp);
     }
 
@@ -886,31 +1038,49 @@ void recordEvent(byte t, byte d1, byte d2, byte ch) {
     } else if (isNoteEnd) {
       uint16_t startTs = activeNoteStartTs[ch][d1];
       if (startTs != 0xFFFF) {
-        if (quantGrid != 0 && quantStrength > 0) {
-          unsigned long loopLenLocal = (looperState == STATE_RECORDING) ? 0 : loopLen;
-          finalTs = protectNoteEnd(startTs, finalTs, loopLenLocal, looperState == STATE_RECORDING);
-        }
+        // вызывается всегда: на тиковой сетке Note Off в том же тике, что и Note On, даёт ноту нулевой длины
+        unsigned long loopLenLocal = (looperState == STATE_RECORDING) ? 0 : loopLenTicks;
+        finalTs = protectNoteEnd(startTs, finalTs, loopLenLocal, looperState == STATE_RECORDING);
         activeNoteStartTs[ch][d1] = 0xFFFF;
       }
     }
+
+    // ---- CC в овердабе: стираем старое там, где прошла ручка ----
+    if (t == 0xB0 && looperState == STATE_OVERDUB && loopLenTicks > 0) {
+      CcOdState &s = ccOd[ch][d1];
+      uint32_t pos = finalTs % loopLenTicks;
+      int32_t dt = (int32_t)(currentTick - s.tick);
+      bool cont = s.touched && (now - s.ms) <= CC_OVERDUB_GAP_MS && dt >= 0;
+      if (cont && dt > 0) eraseCCRange(ch, d1, (uint32_t)s.pos + 1, (uint32_t)dt);  // (lastPos .. pos]
+      else                eraseCCRange(ch, d1, pos, 1);                              // новый сегмент / тот же тик
+      s.ms = now; s.tick = currentTick; s.pos = (uint16_t)pos; s.touched = true;
+      ccOdErased = true;
+    }
   }
 
-  if (deviceConnected) {
+  // BLE: поток CC ограничиваем (иначе notify тормозит основной цикл)
+  bool bleOk = true;
+  if (t == 0xB0) {
+    static unsigned long lastCcBle = 0;
+    if (now - lastCcBle < 40) bleOk = false; else lastCcBle = now;
+  }
+
+  if (deviceConnected && bleOk) {
     if (looperState == STATE_RECORDING) {
-      if (t == 0xB0) sendBleNotify("/rec_cc " + String(finalTs));
-      else if (isNoteStart) sendBleNotify("/rec_noteon " + String(d1) + " " + String(finalTs));
-      else if (isNoteEnd) sendBleNotify("/rec_noteoff " + String(d1) + " " + String(finalTs));
+      uint32_t ms = ticksToBleMs(finalTs);                 // клиент ждёт мс
+      if (t == 0xB0) sendBleNotify("/rec_cc " + String(ms));
+      else if (isNoteStart) sendBleNotify("/rec_noteon " + String(d1) + " " + String(ms));
+      else if (isNoteEnd) sendBleNotify("/rec_noteoff " + String(d1) + " " + String(ms));
     }
     else {
       float posNorm = 0.0;
-      if (loopLen > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
+      if (loopLenTicks > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
         if (looperState == STATE_OVERDUB) {
-          posNorm = (float)finalTs / (float)loopLen;
+          posNorm = (float)finalTs / (float)loopLenTicks;
         } else {
-          posNorm = (float)((now - playStart) % loopLen) / (float)loopLen;
+          posNorm = (float)((currentTick - playStartTick) % loopLenTicks) / (float)loopLenTicks;
         }
       }
-
       if (t == 0xB0) sendBleNotify("/cc " + String(posNorm, 4));
       else if (t == 0x90 && d2 > 0) sendBleNotify("/noteon " + String(d1) + " " + String(posNorm, 4));
       else if (t == 0x80 || (t == 0x90 && d2 == 0)) sendBleNotify("/noteoff " + String(d1) + " " + String(posNorm, 4));
@@ -919,10 +1089,25 @@ void recordEvent(byte t, byte d1, byte d2, byte ch) {
 
   if (!recordIt) return;
 
+  // Событие сыграно вживую прямо сейчас: в овердабе (и при дозаписи Note Off)
+  // оно НЕ должно сразу проигрываться лупером ещё раз — только со следующего круга.
+  bool alreadySounded = (looperState != STATE_RECORDING);
+
+  // CC: в одном тике остаётся одно значение (последнее). Актуально для REC;
+  // в OVERDUB дубль уже стёрт eraseCCRange().
+  if (t == 0xB0) {
+    int lim = eventCount > 64 ? eventCount - 64 : 0;
+    for (int i = eventCount - 1; i >= lim; i--) {
+      MidiEvent &e = events[i];
+      if (e.type == 0xB0 && e.ch == ch && e.d1 == d1 && e.timestamp == finalTs && e.layer == currentLayer) {
+        e.d2 = d2;
+        e.played = alreadySounded;
+        return;
+      }
+    }
+  }
+
   if (eventCount < 5000) {
-    // Событие сыграно вживую прямо сейчас: в овердабе (и при дозаписи Note Off)
-    // оно НЕ должно сразу проигрываться лупером ещё раз — только со следующего круга.
-    bool alreadySounded = (looperState != STATE_RECORDING);
     events[eventCount++] = {finalTs, t, d1, d2, ch, currentLayer, alreadySounded};
   }
 }
@@ -933,10 +1118,9 @@ void handleUsbMidiInput() {
   midiEventPacket_t p;
   while (usbMidi.readPacket(&p)) {
     uint8_t status = p.byte1;
-
     if (status == 0xF8) { if (acceptClockSource(CLK_USB)) handleClock(); continue; }
-    if (status == 0xFA || status == 0xFB) { if (acceptClockSource(CLK_USB)) handleStart(); continue; }
-
+    if (status == 0xFA) { if (acceptClockSource(CLK_USB)) handleStart(); continue; }
+    if (status == 0xFB) { if (acceptClockSource(CLK_USB)) handleContinue(); continue; }
     uint8_t type = status & 0xF0;
     uint8_t ch = (status & 0x0F) + 1;
     if (type == 0x90 || type == 0x80 || type == 0xB0) {
@@ -947,14 +1131,12 @@ void handleUsbMidiInput() {
 #endif
 
 void playback() {
-  if (looperState != STATE_PLAYING && looperState != STATE_OVERDUB) return;
-  unsigned long now = millis();
-  unsigned long pos = (now - playStart) % loopLen;
-  static unsigned long lastPos = 0;
-
+  if ((looperState != STATE_PLAYING && looperState != STATE_OVERDUB) || loopLenTicks == 0) return;
+  unsigned long now = millis();                                   // только для CC-takeover и echo-guard
+  uint32_t pos = (currentTick - playStartTick) % loopLenTicks;    // позиция следует за входящим клоком
+  static uint32_t lastPos = 0;
   if (pos < lastPos) {
     for (int i = 0; i < eventCount; i++) events[i].played = false;
-
     if (pendingLoadSlot >= 1) {
       int slotToLoad = pendingLoadSlot;
       pendingLoadSlot = -1;
@@ -962,17 +1144,18 @@ void playback() {
       return;
     }
   }
-
   for (int i = 0; i < eventCount; i++) {
     if (events[i].played) continue;
     if (pos >= events[i].timestamp) {
       if (events[i].type == 0xB0) {
-        if (now - ccTakeover[events[i].ch][events[i].d1] < 1200) { events[i].played = true; continue; }
-        if (events[i].layer < ccMaxLayer[events[i].ch][events[i].d1]) { events[i].played = true; continue; }
-        lastSentCCTime[events[i].ch-1][events[i].d1] = now;
+        byte c = events[i].ch, n = events[i].d1;
+        // в овердабе CC, которые трогали, молчат до выхода из овердаба
+        if (looperState == STATE_OVERDUB && ccOd[c][n].touched) { events[i].played = true; continue; }
+        // живой перехват ручкой вне овердаба
+        if (now - ccTakeover[c][n] < 1200) { events[i].played = true; continue; }
+        lastSentCCTime[c-1][n] = now;
       }
       if (events[i].type == 0x90 || events[i].type == 0x80) lastSentNoteTime[events[i].ch-1][events[i].d1] = now;
-
       sendMidi(events[i].type, events[i].d1, events[i].d2, events[i].ch);
       events[i].played = true;
     }
@@ -980,15 +1163,19 @@ void playback() {
   lastPos = pos;
 }
 
-// Резервный внутренний счёт долей, если внешнего MIDI-клока нет
+// Резервный внутренний генератор тиков, если внешнего MIDI-клока нет.
+// Работает в сглаженном темпе (tickPeriodUs), без дрейфа (накопитель в микросекундах).
 void handleInternalClock() {
-  unsigned long now = millis();
-  if (now - lastClockTime >= 1200) {
-    if (now - lastBeatTime >= 545) {
-      lastBeatTime = now;
-      if (beatInBar == 0) triggerQuantizedAction();
-      beatInBar = (beatInBar + 1) % 4;
-    }
+  static bool running = false;
+  static uint32_t nextUs = 0;
+  if (millis() - lastClockTime < 1200) { running = false; return; }   // внешний клок жив
+  uint32_t nowUs = micros();
+  uint32_t tickUs = tickPeriodUs;
+  if (tickUs < 1000) tickUs = 1000;
+  if (!running) { running = true; nextUs = nowUs + tickUs; return; }
+  while ((int32_t)(nowUs - nextUs) >= 0) {   // догоняем пропущенные тики без дрейфа
+    nextUs += tickUs;
+    advanceTick(millis());
   }
 }
 
@@ -1017,6 +1204,7 @@ String gridName(int g) {
     default: return "OFF";
   }
 }
+
 // Что именно подтягивается к сетке: начала нот, концы нот или оба
 String targetName(int t) {
   switch (t) {
@@ -1025,13 +1213,14 @@ String targetName(int t) {
     default:          return "start+end";
   }
 }
+
 String signedStr(int v) {
   return (v > 0 ? "+" : "") + String(v);
 }
 
 // ================== UI: действия ==================
 bool loopIsPlaying() {
-  return loopLen > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB);
+  return loopLenTicks > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB);
 }
 
 void uiDoSave(int slot) {
@@ -1039,6 +1228,7 @@ void uiDoSave(int slot) {
   if (savePreset(slot)) toast("Saved " + String(slot));
   else toast("Save failed");
 }
+
 void uiDoLoad(int slot) {
   selectedPresetSlot = slot;
   if (!presetExists(slot)) { toast("Slot " + String(slot) + " empty"); return; }
@@ -1046,31 +1236,36 @@ void uiDoLoad(int slot) {
   if (loopIsPlaying()) toast("Load " + String(slot) + " at loop end");
   else toast("Load " + String(slot) + " on beat 1");
 }
+
 void uiDoApplyQuant() {
-  if (eventCount <= 0 || loopLen == 0) { toast("No loop"); return; }
+  if (eventCount <= 0 || loopLenTicks == 0) { toast("No loop"); return; }
   if (quantGrid == 0 || quantStrength <= 0) { toast("Grid is OFF"); return; }
   applyQuantizeToLoop();
   toast("Quantized");
 }
+
 void uiDoHalf() {
-  if (!loopIsPlaying() || loopLen < 500) { toast("Need playing loop"); return; }
+  if (!loopIsPlaying() || loopLenTicks < BEAT_TICKS) { toast("Need playing loop"); return; }
   halfLoop();
   toast("Loop /2");
 }
+
 void uiDoDouble() {
   if (!loopIsPlaying()) { toast("Need playing loop"); return; }
-  if (loopLen * 2 > 65000) { toast("Too long"); return; }
+  if (loopLenTicks * 2 > 65000) { toast("Too long"); return; }
   doubleLoop();
   toast("Loop x2");
 }
+
 void uiDoTranspose(int semitones) {
   if (semitones == 0) { toast("No change"); return; }
   if (!loopIsPlaying()) { toast("Need playing loop"); return; }
   transposeLoop(semitones);
   toast("Transpose " + signedStr(semitones));
 }
+
 void uiDoUndo() {
-  if (loopLen == 0 || currentLayer == 0) { toast("Nothing to undo"); return; }
+  if (loopLenTicks == 0 || currentLayer == 0) { toast("Nothing to undo"); return; }
   undoLastLayer();
   toast("Undo");
 }
@@ -1117,6 +1312,7 @@ void menuActivate() {
     case MI_DOUBLE:     uiDoDouble();        uiMode = UI_NORMAL; break;
   }
 }
+
 // Клик энкодера при редактировании значения: подтвердить
 void menuCommit() {
   switch (menuCursor) {
@@ -1228,7 +1424,6 @@ void handleEncoder() {
   }
 
   accum += delta;
-
   while (accum >= 4) {
     applyEncoderDelta(1);
     accum -= 4;
@@ -1301,7 +1496,6 @@ void handleMenuButtons() {
       else onMenuButtonRelease(i);
     }
   }
-
   // Удержание кнопки пресетов 2 с — выбор слота для SAVE
   if (presetBtnDown && !presetLongFired && now - presetBtnStart >= PRESET_LONG_PRESS_MS) {
     presetLongFired = true;
@@ -1312,33 +1506,28 @@ void handleMenuButtons() {
 }
 
 // ================== OLED ==================
+
 // Безопасная разность времён (задача OLED может прочитать "now" раньше, чем основной цикл обновит метку)
 unsigned long safeSince(unsigned long now, unsigned long t) {
   long d = (long)(now - t);
   return d < 0 ? 0 : (unsigned long)d;
 }
 
-// BPM по длительности доли (MIDI-клок)
+// BPM: сглаженное значение (скользящее среднее по окну тиков)
 int currentBpm() {
-  unsigned long bd = (loopBeatDuration > 0) ? loopBeatDuration : 545;
-  return (int)((60000UL + bd / 2) / bd);
+  return (int)(activeBPM + 0.5f);
 }
 
 // Количество тактов: в записи — уже полностью записанные, в игре — длина лупа
 String barsText() {
-  unsigned long now = millis();
-  unsigned long bd = (loopBeatDuration > 0) ? loopBeatDuration : 545;
-  float barMs = 4.0f * (float)bd;
   float bars = 0.0f;
-
   if (looperState == STATE_RECORDING) {
-    bars = floor((float)safeSince(now, recStart) / barMs);
-  } else if (loopLen > 0) {
-    bars = (float)loopLen / barMs;
+    bars = floorf((float)ticksSince(recStartTick) / (float)BAR_TICKS);
+  } else if (loopLenTicks > 0) {
+    bars = (float)loopLenTicks / (float)BAR_TICKS;
   } else {
     return "- bars";
   }
-
   float r = round(bars);
   if (fabs(bars - r) < 0.1f) {
     int n = (int)r;
@@ -1354,7 +1543,6 @@ void drawBarSegments(int n, float progress) {
   if (n < 1) n = 1;
   if (n > 40) n = 40;
   if (progress < 0.0f) progress = 0.0f;
-
   int gap = (n <= 16) ? 2 : 1;
   int segW = (SCREEN_WIDTH - gap * (n - 1)) / n;
   if (segW < 2) segW = 2;
@@ -1367,7 +1555,6 @@ void drawBarSegments(int n, float progress) {
     float frac = progress - (float)i;
     if (frac < 0.0f) frac = 0.0f;
     if (frac > 1.0f) frac = 1.0f;
-
     display.drawRect(x, y, segW, h, SSD1306_WHITE);
     if (segW >= 6) {
       int innerW = segW - 4;
@@ -1430,7 +1617,6 @@ void drawMenu() {
     int y = 29 + r * 9;
     bool sel = (idx == menuCursor);
     String val = menuValueText(idx, sel && uiMode == UI_MENU_EDIT);
-
     if (sel) {
       display.fillRect(0, y - 1, SCREEN_WIDTH, 9, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
@@ -1457,7 +1643,6 @@ void drawChannelsMenu() {
     bool sel = (chCursor == i);
     String t = String(i + 1);
     int tx = cx + (16 - (int)t.length() * 6) / 2;
-
     if (on) {
       display.fillRect(cx + 2, cy + 2, 12, 7, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
@@ -1467,28 +1652,23 @@ void drawChannelsMenu() {
     display.setCursor(tx, cy + 2);
     display.print(t);
     display.setTextColor(SSD1306_WHITE);
-
     if (sel) display.drawRect(cx, cy, 16, 11, SSD1306_WHITE);
   }
-
   // Нижняя строка: ALL ON / ALL OFF
   bool selOn = (chCursor == 16);
   bool selOff = (chCursor == 17);
-
   if (selOn) {
     display.fillRect(0, 49, 44, 8, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
   } else display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 49);
   display.print("ALL ON");
-
   if (selOff) {
     display.fillRect(64, 49, 50, 8, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
   } else display.setTextColor(SSD1306_WHITE);
   display.setCursor(66, 49);
   display.print("ALL OFF");
-
   display.setTextColor(SSD1306_WHITE);
 }
 
@@ -1515,7 +1695,6 @@ void drawPresetPicker() {
     display.print(t);
   }
   display.setTextColor(SSD1306_WHITE);
-
   display.setCursor(0, 50);
   display.print("Turn=pick Enc=OK");
 }
@@ -1526,8 +1705,8 @@ void updateOLED() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  unsigned long now = millis();
-  unsigned long recElapsed = safeSince(now, recStart);
+  unsigned long now = millis();                       // нужен ниже для toast/кнопок
+  uint32_t recTicks = ticksSince(recStartTick);
 
   // Шапка, строка 1: состояние + такты
   display.setCursor(0, 0);
@@ -1535,36 +1714,30 @@ void updateOLED() {
   display.setCursor(80, 0);
   display.print(barsText());
 
-  // Шапка, строка 2: BPM + длина в секундах (в записи — текущее время записи)
-  unsigned long lenMs = (looperState == STATE_RECORDING) ? recElapsed : loopLen;
+  // Шапка, строка 2: BPM + длина в секундах (по текущему темпу; в записи — текущее время записи)
+  uint32_t lenTicks = (looperState == STATE_RECORDING) ? recTicks : loopLenTicks;
   display.setCursor(0, 9);
   display.print(String(currentBpm()) + " BPM");
   display.setCursor(80, 9);
-  display.print(String(lenMs / 1000.0f, 2) + "s");
+  display.print(String(ticksToMs(lenTicks) / 1000.0f, 2) + "s");
 
   // Прогресс-бар по тактам
-  unsigned long bd = (loopBeatDuration > 0) ? loopBeatDuration : 545;
-  float barMs = 4.0f * (float)bd;
   int segs = 1;
   float progress = 0.0f;
-
   if (looperState == STATE_RECORDING) {
     // растёт: записанные такты залиты, текущий заполняется
-    float elapsedBars = (float)recElapsed / barMs;
+    float elapsedBars = (float)recTicks / (float)BAR_TICKS;
     segs = (int)floorf(elapsedBars) + 1;
     progress = elapsedBars;
-  } else if (loopLen > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
+  } else if (loopLenTicks > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
     // столько сегментов, сколько тактов в лупе; заполнение по позиции воспроизведения
-    segs = (int)roundf((float)loopLen / barMs);
+    segs = (int)roundf((float)loopLenTicks / (float)BAR_TICKS);
     if (segs < 1) segs = 1;
-    unsigned long pos = safeSince(now, playStart) % loopLen;
-    progress = (float)pos / (float)loopLen * (float)segs;
+    uint32_t pos = ticksSince(playStartTick) % loopLenTicks;
+    progress = (float)pos / (float)loopLenTicks * (float)segs;
   } else {
-    // IDLE: один прямоугольник, заполняется по долям текущего такта
-    unsigned long bdur = (beatDuration > 0) ? beatDuration : 545;
-    unsigned long tib = safeSince(now, lastBeatTime);
-    if (tib > bdur) tib = bdur;
-    progress = ((float)beatInBar + (float)tib / (float)bdur) / 4.0f;
+    // IDLE: один прямоугольник, заполняется по тикам текущего такта
+    progress = (float)(beatInBar * PPQN + tickInBeat) / (float)BAR_TICKS;
     segs = 1;
   }
   drawBarSegments(segs, progress);
@@ -1580,7 +1753,6 @@ void updateOLED() {
   } else {
     display.setCursor(0, 28);
     display.print("Grid:" + gridName(quantGrid) + " Str:" + String(quantStrength) + "%");
-
     display.setCursor(0, 37);
     display.print("Quantize:" + targetName(quantTarget));
 
@@ -1690,7 +1862,7 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.print("Looper v60 ready");
+    display.print("Looper v2 ready");
     display.display();
   }
 #else
@@ -1711,7 +1883,7 @@ void setup() {
 
   MIDI.setHandleClock([]() { if (acceptClockSource(CLK_DIN)) handleClock(); });
   MIDI.setHandleStart([]() { if (acceptClockSource(CLK_DIN)) handleStart(); });
-  MIDI.setHandleContinue([]() { if (acceptClockSource(CLK_DIN)) handleStart(); });
+  MIDI.setHandleContinue([]() { if (acceptClockSource(CLK_DIN)) handleContinue(); });
   MIDI.setHandleNoteOn([](byte ch, byte n, byte v) { recordEvent(0x90, n, v, ch); });
   MIDI.setHandleNoteOff([](byte ch, byte n, byte v) { recordEvent(0x80, n, v, ch); });
   MIDI.setHandleControlChange([](byte ch, byte n, byte v) { recordEvent(0xB0, n, v, ch); });
@@ -1734,7 +1906,6 @@ void setup() {
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
-
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
@@ -1757,8 +1928,24 @@ void loop() {
   handleEncoderSwitch();
   handleMenuButtons();
   handleUiTimeout();
+
+  // Выход из овердаба (педаль, BLE, undo, reset, load): сбрасываем состояние перезаписи CC,
+  // после этого CC снова воспроизводятся
+  static LooperState prevLooperState = STATE_IDLE;
+  if (prevLooperState == STATE_OVERDUB && looperState != STATE_OVERDUB) onOverdubExit();
+  prevLooperState = looperState;
+
   playback();
   updateLED();
+
+  // Темп для BLE-клиента (только когда нет лупа). Порог 0.5 BPM — защита от спама
+  // уведомлениями (BPM меняется на каждом тике на доли процента); на движок не влияет.
+  static float lastReportedBpm = 0.0f;
+  if (looperState == STATE_IDLE && loopLenTicks == 0 && fabsf(activeBPM - lastReportedBpm) >= 0.5f) {
+    lastReportedBpm = activeBPM;
+    bleBeatMs = loopBeatDuration;
+    sendBeatInfo();
+  }
 
   if (needSendPresetStatus && deviceConnected && millis() - connectStatusTime > 400) {
     sendPresetStatus();
@@ -1770,34 +1957,33 @@ void loop() {
 
   if (visualDumpActive && deviceConnected) {
     unsigned long nowDump = millis();
-
     if (visualDumpIndex < eventCount) {
       if (visualDumpIndex > 0 && nowDump - visualDumpLastPosSend >= VISUAL_DUMP_POS_INTERVAL) {
         visualDumpLastPosSend = nowDump;
-        sendBleNotify("/rec_pos " + String(events[visualDumpIndex - 1].timestamp + 1));
+        sendBleNotify("/rec_pos " + String(ticksToBleMs(events[visualDumpIndex - 1].timestamp + 1)));
       }
-
       if (nowDump - lastVisualDumpTime >= VISUAL_DUMP_EVENT_INTERVAL) {
         lastVisualDumpTime = nowDump;
         MidiEvent &e = events[visualDumpIndex];
+        uint32_t evMs = ticksToBleMs(e.timestamp);
         if (e.type == 0x90 && e.d2 > 0) {
-          sendBleNotify("/rec_noteon " + String(e.d1) + " " + String(e.timestamp));
+          sendBleNotify("/rec_noteon " + String(e.d1) + " " + String(evMs));
         } else if (e.type == 0x80 || (e.type == 0x90 && e.d2 == 0)) {
-          sendBleNotify("/rec_noteoff " + String(e.d1) + " " + String(e.timestamp));
+          sendBleNotify("/rec_noteoff " + String(e.d1) + " " + String(evMs));
         } else if (e.type == 0xB0) {
-          sendBleNotify("/rec_cc " + String(e.timestamp));
+          sendBleNotify("/rec_cc " + String(evMs));
         }
         visualDumpIndex++;
       }
     }
     else if (visualDumpFinishStage == 0) {
-      sendBleNotify("/rec_pos " + String(loopLen));
+      sendBleNotify("/rec_pos " + String(ticksToBleMs(loopLenTicks)));
       sendBleNotify("/state " + stateName());
       visualDumpFinishStage = 1;
       visualDumpFinishTime = nowDump;
     }
     else if (visualDumpFinishStage == 1 && nowDump - visualDumpFinishTime >= 20) {
-      sendBleNotify("/rec_pos " + String(loopLen));
+      sendBleNotify("/rec_pos " + String(ticksToBleMs(loopLenTicks)));
       sendBleNotify("/state " + stateName());
       visualDumpFinishStage = 0;
       visualDumpActive = false;
@@ -1806,20 +1992,16 @@ void loop() {
 
   if (deviceConnected && !visualDumpActive && (millis() - lastBleUpdate >= BLE_INTERVAL)) {
     lastBleUpdate = millis();
-    if (loopLen > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
-      uint32_t currentPos = (millis() - playStart) % loopLen;
-      float posNorm = (float)currentPos / (float)loopLen;
+    if (loopLenTicks > 0 && (looperState == STATE_PLAYING || looperState == STATE_OVERDUB)) {
+      uint32_t currentPos = (currentTick - playStartTick) % loopLenTicks;
+      float posNorm = (float)currentPos / (float)loopLenTicks;
       sendBleNotify("/pos " + String(posNorm, 4));
     }
     else if (looperState == STATE_RECORDING) {
-      sendBleNotify("/rec_pos " + String(millis() - recStart));
+      sendBleNotify("/rec_pos " + String(ticksToBleMs(ticksSince(recStartTick))));
     }
     else if (looperState == STATE_IDLE) {
-      unsigned long now = millis();
-      unsigned long timeInBeat = now - lastBeatTime;
-      if (timeInBeat > beatDuration) timeInBeat = beatDuration;
-
-      float idlePosNorm = ((float)beatInBar + ((float)timeInBeat / (float)beatDuration)) / 4.0f;
+      float idlePosNorm = (float)(beatInBar * PPQN + tickInBeat) / (float)BAR_TICKS;
       sendBleNotify("/pos " + String(idlePosNorm, 4));
     }
   }
