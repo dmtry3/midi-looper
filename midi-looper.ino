@@ -31,7 +31,6 @@
 
 #define LOOPER_PIN 2
 #define LED_PIN 1
-#define MIDICHANNEL 12
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define PRESET_COUNT 5
@@ -1870,7 +1869,7 @@ void setup() {
   oledReady = false;
 #endif
 
-  MIDI_Serial.begin(31250, SERIAL_8N1, 16, 17);
+  MIDI_Serial.begin(31250, SERIAL_8N1, 6, 7);
   MIDI.begin(MIDI_CHANNEL_OMNI); MIDI.turnThruOff();
   Serial.println("BOOT: MIDI ok");
 
