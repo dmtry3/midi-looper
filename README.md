@@ -16,11 +16,7 @@ pio device monitor      # Serial, 115200
 
 ## 1. Железо
 
-Плата: ESP32-S3-Zero / SuperMini (ESP32-S3, 4 МБ flash).
-
-![Распиновка ESP32-S3-Zero](docs/esp32-s3-zero-pinout.jpg)
-
-![Схема подключения](docs/circuit-diagram.jpg)
+Плата: ESP32-S3 SuperMini (4 МБ flash).
 
 | Узел | Пины |
 |---|---|
@@ -31,6 +27,8 @@ pio device monitor      # Serial, 115200
 | Энкодер CLK / DT / SW | 5 / 4 / 3 |
 | OLED SSD1315 (I2C, 0x3C) | SDA 9, SCL 8 |
 | Кнопки у экрана (сверху вниз) | 13, 12, 11, 10 |
+
+> Схема и распиновка в [docs/](docs/) относятся к прошлой версии на ESP32-S3-Zero и могут не совпадать с текущей разводкой. Актуальные пины в таблице выше.
 
 ## 2. Настройки прошивки (`#define` в начале [src/main.cpp](src/main.cpp))
 
